@@ -445,3 +445,52 @@ def calculate_optimal_entry_exit(
             "volume_pressure": volume_data.get("pressure"),
         },
     }
+
+
+# -----------------------------------------------------------------------------
+# Compatibility wrapper expected by other modules
+# -----------------------------------------------------------------------------
+
+def detect_levels(rates, lookback: int = 100, swing_window: int = 5) -> dict:
+    """
+    Backward-compatible wrapper that returns a simplified levels dict expected by
+    mt5_handler.get_symbol_summary() and other modules.
+
+    Returned keys:
+      - major_low, recent_low, major_high, recent_high
+      - support, resistance
+      - order_block_buy, order_block_sell
+      - levels_raw (full output from detect_multiple_levels)
+    """
+    mult = detect_multiple_levels(rates, lookback=lookback, swing_window=swing_window)
+    divergence = detect_advanced_divergence(rates)
+    volume = detect_volume_pressure(rates)
+
+    # Prefer explicit confluence OB prices if available
+    ob_buy = None
+    ob_sell = None
+    for z in mult.get("critical_zones", []):
+        if z.get("type") == "SUPPORT_CRITICAL" and ob_buy is None:
+            ob_buy = z.get("price")
+        if z.get("type") == "RESISTANCE_CRITICAL" and ob_sell is None:
+            ob_sell = z.get("price")
+
+    # Fallbacks
+    if ob_buy is None:
+        ob_buy = mult.get("recent_support") or mult.get("major_support") or 0
+    if ob_sell is None:
+        ob_sell = mult.get("recent_resistance") or mult.get("major_resistance") or 0
+
+    return {
+        "major_low": float(mult.get("major_support", 0)),
+        "recent_low": float(mult.get("recent_support", 0)),
+        "major_high": float(mult.get("major_resistance", 0)),
+        "recent_high": float(mult.get("recent_resistance", 0)),
+        "support": float(mult.get("recent_support", 0)),
+        "resistance": float(mult.get("recent_resistance", 0)),
+        "order_block_buy": float(ob_buy),
+        "order_block_sell": float(ob_sell),
+        "levels_raw": mult,
+        "divergence": divergence,
+        "volume": volume,
+    }
