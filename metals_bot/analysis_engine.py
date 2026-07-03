@@ -198,23 +198,45 @@ def analyze_metals_with_memory():
     saved = extract_and_save_signals(response_text, liquidity_context, h1_context)
 
     # دمج الاقتراح البرمجي مع ناتج Gemini (أولوية للإشارات المحفوظة)
-    final_lines = []
-    final_lines.append(f"📍 DXY: {dxy_text}")
-    final_lines.append(f"🪙 الذهب: {_format_brief('XAUUSD', summaries['gold_h1'])}")
-    final_lines.append(f"🥈 الفضة: {_format_brief('XAGUSD', summaries['silver_h1'])}")
+    import time
 
-    # إظهار الاقتراحات البرمجية
-    final_lines.append("\n══ اقتراح برمجي (مبني على المستويات):")
-    final_lines.append(f"ذهب: {_format_signal_text('XAUUSD', gold_sugg)}")
-    final_lines.append(f"فضة: {_format_signal_text('XAGUSD', silver_sugg)}")
+    def _filter_gemini_for_symbol(gemini_text: str, symbol: str) -> str:
+        if not gemini_text:
+            return ""
+        lines = gemini_text.splitlines()
+        symbol_lines = [ln for ln in lines if symbol.upper() in ln or symbol.lower() in ln.lower()]
+        if symbol_lines:
+            return "\n".join(symbol_lines)
+        return gemini_text[:1000] + ("..." if len(gemini_text) > 1000 else "")
 
-    # الآن نضيف مخرجات Gemini
-    final_lines.append('\n══ إخراج Gemini:')
-    final_lines.append(response_text)
+    # Build gold message
+    gold_lines = []
+    gold_lines.append(f"📍 DXY: {dxy_text}")
+    gold_lines.append(f"🪙 الذهب: {_format_brief('XAUUSD', summaries['gold_h1'])}")
+    gold_lines.append("\n══ اقتراح برمجي (مبني على المستويات):")
+    gold_lines.append(f"ذهب: {_format_signal_text('XAUUSD', gold_sugg)}")
+    gold_lines.append("\n══ إخراج Gemini (مختصر):")
+    gold_lines.append(_filter_gemini_for_symbol(response_text, "XAUUSD"))
 
-    final_report = "\n".join(final_lines)
+    gold_report = "\n".join(gold_lines)
 
-    if send_to_telegram(final_report):
-        log.info("✅ التقرير أُرسل لـ Telegram.")
+    # Build silver message
+    silver_lines = []
+    silver_lines.append(f"📍 DXY: {dxy_text}")
+    silver_lines.append(f"🥈 الفضة: {_format_brief('XAGUSD', summaries['silver_h1'])}")
+    silver_lines.append("\n══ اقتراح برمجي (مبني على المستويات):")
+    silver_lines.append(f"فضة: {_format_signal_text('XAGUSD', silver_sugg)}")
+    silver_lines.append("\n══ إخراج Gemini (مختصر):")
+    silver_lines.append(_filter_gemini_for_symbol(response_text, "XAGUSD"))
+
+    silver_report = "\n".join(silver_lines)
+
+    # Send separately with short pause (to avoid hitting telegram rate limits)
+    sent_gold = send_to_telegram(gold_report)
+    time.sleep(1.0)
+    sent_silver = send_to_telegram(silver_report)
+
+    if sent_gold and sent_silver:
+        log.info("✅ تقارير الذهب والفضة أُرسلت إلى Telegram.")
     else:
-        log.warning("⚠️ فشل إرسال التقرير لـ Telegram.")
+        log.warning("⚠️ فشل إرسال أحد التقارير إلى Telegram.")
