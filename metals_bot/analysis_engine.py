@@ -6,7 +6,10 @@ from datetime import datetime
 
 from config import BARS_H4, BARS_H1, BARS_M15, BARS_FVG, MIN_RR_RATIO
 from logger import log
-from database import get_win_rate, save_analysis
+from database import (
+    get_win_rate, save_analysis,
+    save_signal_return_id, update_signal_review,
+)
 from mt5_handler import (
     ensure_mt5_connected,
     get_symbol_summary,
@@ -122,6 +125,61 @@ def _format_signal_text(sym: str, suggestion: dict) -> str:
     )
 
 
+def _parse_json_block(text: str) -> dict | None:
+    import re, json
+    m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if not m:
+        # try to find a plain JSON object if no backticks
+        m2 = re.search(r"(\{\s*\"report\".*\})", text, re.DOTALL)
+        if not m2:
+            return None
+        try:
+            return json.loads(m2.group(1))
+        except Exception:
+            return None
+    try:
+        return json.loads(m.group(1))
+    except Exception:
+        return None
+
+
+def _build_review_prompt(symbol: str, suggestion: dict, market_context: dict) -> str:
+    """
+    Build a strict review-only prompt for Gemini. market_context contains summaries and DXY.
+    The prompt forces Gemini to output JSON with 'reviews' array and fields: approved, confidence, review_warning, notes.
+    """
+    dxy = market_context.get('dxy_text', '')
+    summary = market_context.get('summary', {})
+    h1 = market_context.get('h1', {})
+
+    instruction = (
+        "أنت مراجع فني فقط — لا تقترح قرارات تنفيذ.\n"
+        "راجع الإشارة التالية وقيّمها بناءً على السياق الفني والمخاطر.\n"
+        "أجب فقط عبر JSON داخل بلوك ```json ... ``` بالصيغة التالية بدقة:\n\n"
+        "{\n"
+        "  \"report\": \"<ملخّص قصير>\",\n"
+        "  \"reviews\": [\n"
+        "    {\"symbol\":\"XAUUSD\",\"approved\":true,\"confidence\":0.85,\"review_warning\":\"liquidity low\",\"notes\":\"...\"}\n"
+        "  ]\n"
+        "}\n\n"
+        "ملاحظات: يجب أن تحتوي القائمة reviews على عنصر واحد لهذا الرمز. approved قيمة منطقية، confidence رقم بين 0 و1.\n"
+    )
+
+    sig = suggestion
+    sig_text = (
+        f"Signal: {sig.get('signal')} Entry={sig.get('entry')} TP1={sig.get('tp1')} TP2={sig.get('tp2')} SL={sig.get('sl')} RR={sig.get('rr')}"
+    )
+
+    context = (
+        f"DXY: {dxy}\n"
+        f"Market H1 summary: trend={h1.get('trend')} last_close={h1.get('last_close')} support={h1.get('support')} resistance={h1.get('resistance')}\n"
+        f"Signal to review: {sig_text}\n"
+    )
+
+    prompt = context + "\n" + instruction
+    return prompt
+
+
 def analyze_metals_with_memory():
     log.info("═" * 45)
     log.info("🔄 بدء دورة التحليل...")
@@ -166,7 +224,23 @@ def analyze_metals_with_memory():
     gold_sugg = _suggest_signals_from_levels("XAUUSD", summaries['gold_h1'])
     silver_sugg = _suggest_signals_from_levels("XAGUSD", summaries['silver_h1'])
 
-    # بناء prompt
+    # حفظ قرار الاستراتيجية (إن لم يكن WAIT) واسترجاع id
+    saved_signals = {}
+    for sym, sugg in [("XAUUSD", gold_sugg), ("XAGUSD", silver_sugg)]:
+        if sugg.get('signal') != 'WAIT':
+            sid = save_signal_return_id(
+                symbol = sym,
+                direction = sugg['signal'],
+                entry = sugg['entry'],
+                tp1 = sugg['tp1'],
+                tp2 = sugg['tp2'],
+                sl = sugg['sl'],
+                rr_ratio = sugg.get('rr', 0.0),
+            )
+            if sid:
+                saved_signals[sym] = {'id': sid, 'suggestion': sugg}
+
+    # بناء prompt العام وإرسال طلب Gemini العام (تحليلي)
     prompt = _build_prompt(
         dxy_text      = dxy_text,
         dxy_direction = dxy_direction,
@@ -193,11 +267,30 @@ def analyze_metals_with_memory():
     save_current_analysis(response_text)
     save_analysis(content=response_text, dxy=dxy_text, gold_price=gold_now, silver_price=silver_now)
 
+    # اطلب مراجعة منفصلة لكل إشارة محفوظة بواسطة Gemini (review-only)
+    for sym, info in saved_signals.items():
+        sig = info['suggestion']
+        signal_id = info['id']
+        review_prompt = _build_review_prompt(sym, sig, { 'dxy_text': dxy_text, 'h1': summaries[f"{ 'gold' if sym == 'XAUUSD' else 'silver' }_h1" ] })
+        review_resp = generate_content(review_prompt)
+        parsed = _parse_json_block(review_resp or "")
+        if parsed and parsed.get('reviews'):
+            # find matching review
+            for r in parsed.get('reviews'):
+                if r.get('symbol','').upper() == sym:
+                    approved = int(bool(r.get('approved', False)))
+                    confidence = float(r.get('confidence', 0.0)) if r.get('confidence') is not None else None
+                    review_warning = r.get('review_warning')
+                    update_signal_review(signal_id, approved, confidence, review_warning)
+                    log.info(f"🔎 Gemini review for id={signal_id}: approved={approved} confidence={confidence} warning={review_warning}")
+                    break
+
+    # بالإضافة نقوم باستخراج إشارات Gemini التقليدية (إن وجدت) كـ fallback
     liquidity_context = {"XAUUSD": summaries["gold_h1"].get("liquidity", {}), "XAGUSD": summaries["silver_h1"].get("liquidity", {})}
     h1_context = {"XAUUSD": summaries["gold_h1"], "XAGUSD": summaries["silver_h1"]}
-    saved = extract_and_save_signals(response_text, liquidity_context, h1_context)
+    extras_saved, gemini_report = extract_and_save_signals(response_text, liquidity_context, h1_context)
 
-    # دمج الاقتراح البرمجي مع ناتج Gemini (أولوية للإشارات المحفوظة)
+    # بناء رسائل منفصلة لكل معدن تتضمن قرار الاستراتيجية ونتيجة مراجعة Gemini
     import time
 
     def _filter_gemini_for_symbol(gemini_text: str, symbol: str) -> str:
@@ -209,29 +302,54 @@ def analyze_metals_with_memory():
             return "\n".join(symbol_lines)
         return gemini_text[:1000] + ("..." if len(gemini_text) > 1000 else "")
 
-    # Build gold message
+    # Gold message
+    gold_review = None
+    if 'XAUUSD' in saved_signals:
+        sid = saved_signals['XAUUSD']['id']
+        # fetch review fields from DB quickly
+        try:
+            row = __import__('sqlite3').connect(__import__('config').DB_FILE).execute("SELECT approved, confidence, review_warning FROM signals WHERE id=?", (sid,)).fetchone()
+            if row:
+                gold_review = {'approved': bool(row[0]), 'confidence': row[1], 'review_warning': row[2]}
+        except Exception:
+            gold_review = None
+
     gold_lines = []
     gold_lines.append(f"📍 DXY: {dxy_text}")
     gold_lines.append(f"🪙 الذهب: {_format_brief('XAUUSD', summaries['gold_h1'])}")
     gold_lines.append("\n══ اقتراح برمجي (مبني على المستويات):")
-    gold_lines.append(f"ذهب: {_format_signal_text('XAUUSD', gold_sugg)}")
+    gold_lines.append(f"{_format_signal_text('XAUUSD', gold_sugg)}")
+    if gold_review:
+        status = "✅ Approved" if gold_review.get('approved') else "❌ Rejected"
+        gold_lines.append(f"Gemini Review: {status} | Confidence: {gold_review.get('confidence')} | Warning: {gold_review.get('review_warning')}")
     gold_lines.append("\n══ إخراج Gemini (مختصر):")
     gold_lines.append(_filter_gemini_for_symbol(response_text, "XAUUSD"))
-
     gold_report = "\n".join(gold_lines)
 
-    # Build silver message
+    # Silver message
+    silver_review = None
+    if 'XAGUSD' in saved_signals:
+        sid = saved_signals['XAGUSD']['id']
+        try:
+            row = __import__('sqlite3').connect(__import__('config').DB_FILE).execute("SELECT approved, confidence, review_warning FROM signals WHERE id=?", (sid,)).fetchone()
+            if row:
+                silver_review = {'approved': bool(row[0]), 'confidence': row[1], 'review_warning': row[2]}
+        except Exception:
+            silver_review = None
+
     silver_lines = []
     silver_lines.append(f"📍 DXY: {dxy_text}")
     silver_lines.append(f"🥈 الفضة: {_format_brief('XAGUSD', summaries['silver_h1'])}")
     silver_lines.append("\n══ اقتراح برمجي (مبني على المستويات):")
-    silver_lines.append(f"فضة: {_format_signal_text('XAGUSD', silver_sugg)}")
+    silver_lines.append(f"{_format_signal_text('XAGUSD', silver_sugg)}")
+    if silver_review:
+        status = "✅ Approved" if silver_review.get('approved') else "❌ Rejected"
+        silver_lines.append(f"Gemini Review: {status} | Confidence: {silver_review.get('confidence')} | Warning: {silver_review.get('review_warning')}")
     silver_lines.append("\n══ إخراج Gemini (مختصر):")
     silver_lines.append(_filter_gemini_for_symbol(response_text, "XAGUSD"))
-
     silver_report = "\n".join(silver_lines)
 
-    # Send separately with short pause (to avoid hitting telegram rate limits)
+    # إرسال منفصل
     sent_gold = send_to_telegram(gold_report)
     time.sleep(1.0)
     sent_silver = send_to_telegram(silver_report)
