@@ -83,7 +83,7 @@ def _suggest_signals_from_levels(symbol: str, h1: dict) -> dict:
     sell_ok = entry_sell and tp1_sell and sl_sell and rr_sell >= MIN_RR_RATIO
     buy_ok  = entry_buy  and tp1_buy  and sl_buy  and rr_buy  >= MIN_RR_RATIO
 
-    # لو لا يوجد توافق مع القواعد → WAIT
+    # لو لا ��وجد توافق مع القواعد → WAIT
     if not sell_ok and not buy_ok:
         return {"signal": "WAIT"}
 
@@ -177,6 +177,56 @@ def _build_review_prompt(symbol: str, suggestion: dict, market_context: dict) ->
     )
 
     prompt = context + "\n" + instruction
+    return prompt
+
+
+def _build_prompt(
+    dxy_text: str,
+    dxy_direction: str,
+    gold_now: float,
+    silver_now: float,
+    gold_h4: dict,
+    gold_h1: dict,
+    gold_m15: dict,
+    silver_h4: dict,
+    silver_h1: dict,
+    silver_m15: dict,
+    gold_fvg: dict,
+    silver_fvg: dict,
+    stats: dict,
+    previous: dict,
+) -> str:
+    """
+    Build the main prompt for Gemini containing market context and a clear instruction.
+    The model is asked to provide a readable analysis and to include a JSON block with report and signals
+    so the extractor can parse any signals present.
+    """
+    parts = []
+    parts.append(f"DXY: {dxy_text} | Direction: {dxy_direction}")
+    parts.append("\n-- GOLD H1 --")
+    parts.append(f"Last: {gold_now} | Trend: {gold_h1.get('trend')} | Support: {gold_h1.get('support')} | Resistance: {gold_h1.get('resistance')}")
+    parts.append("Indicators: \n" + str(gold_h1.get('indicators', {})))
+    parts.append("\n-- SILVER H1 --")
+    parts.append(f"Last: {silver_now} | Trend: {silver_h1.get('trend')} | Support: {silver_h1.get('support')} | Resistance: {silver_h1.get('resistance')}")
+    parts.append("Indicators: \n" + str(silver_h1.get('indicators', {})))
+
+    parts.append("\n-- FVGs --")
+    parts.append(f"Gold FVG: {gold_fvg.get('summary') if isinstance(gold_fvg, dict) else gold_fvg}")
+    parts.append(f"Silver FVG: {silver_fvg.get('summary') if isinstance(silver_fvg, dict) else silver_fvg}")
+
+    parts.append("\n-- Stats --")
+    parts.append(str(stats))
+
+    instruction = (
+        "\n\nأنت محلل فني مساعد. أكتب تحليلًا واضحًا ومُفسّرًا للذهب والفضة مبنيًا على البيانات أعلاه. "
+        "اختصر النتائج العملية أولاً (بجملة أو اثنتين). \n"
+        "ثم قَدّم شرحًا مختصرًا للتقنيات والمستويات. \n"
+        "الرجاء إضافة بلوك JSON في النهاية داخل ```json ... ``` به الحقول: report (string) و signals (قائمة احتمالية). "
+        "كل عنصر في signals إن وُجد يجب أن يحتوي: symbol, direction, entry, tp1, tp2, sl. "
+        "إن لم تكن هناك توصية أعد signals: [] أو أدرج status: 'WAIT'."
+    )
+
+    prompt = "\n\n".join(parts) + "\n\n" + instruction
     return prompt
 
 
