@@ -1,7 +1,7 @@
 """
 database.py — قاعدة البيانات
-════════════════════════════════
-كل عمليات SQLite في مكان واحد — Thread-Safe.
+══════════════════════════════
+تحديثات: إضافة حقول مراجعة Gemini ووظائف مساعدة لحفظ الإشارات واستلام تحديثات المراجعة.
 """
 
 import sqlite3
@@ -37,7 +37,7 @@ def db_fetchall(query: str, params: tuple = ()) -> list:
             conn.close()
 
 
-def db_fetchone(query: str, params: tuple = ()):
+def db_fetchone(query: str, params: tuple = ()): 
     with _db_lock:
         conn = sqlite3.connect(DB_FILE, timeout=10.0)
         try:
@@ -105,6 +105,10 @@ def init_db():
             ("entry_filled_time", "TEXT"),
             ("result_profit",     "REAL DEFAULT 0"),
             ("rr_ratio",          "REAL DEFAULT 0"),
+            # new review columns
+            ("review_warning",    "TEXT"),
+            ("approved",          "INTEGER DEFAULT 0"),
+            ("confidence",        "REAL DEFAULT NULL"),
         ])
 
         conn.commit()
@@ -140,6 +144,7 @@ def save_signal(
     """
     يحفظ الإشارة بعد التحقق من صحة الأرقام.
     يُعيد True لو نجح الحفظ.
+    (مصمَّم للبقاء متوافقًا مع الاستدعاءات الحالية)
     """
     if entry <= 0 or sl <= 0 or tp1 <= 0:
         log.warning(
@@ -168,11 +173,72 @@ def save_signal(
     return True
 
 
+def save_signal_return_id(
+    symbol:    str,
+    direction: str,
+    entry:     float,
+    tp1:       float,
+    tp2:       float,
+    sl:        float,
+    rr_ratio:  float = 0.0,
+) -> int:
+    """
+    يحفظ الإشارة ويُعيد id الصف المُدرَج. يعيد 0 عند الفشل.
+    """
+    if entry <= 0 or sl <= 0 or tp1 <= 0:
+        log.warning(f"⚠️ أرقام غير منطقية — تجاهل ({symbol} entry={entry})")
+        return 0
+
+    with _db_lock:
+        conn = sqlite3.connect(DB_FILE, timeout=10.0)
+        try:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO signals
+                    (timestamp, symbol, direction,
+                     entry, tp1, tp2, sl,
+                     rr_ratio, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+            """, (
+                datetime.now().isoformat(),
+                symbol, direction,
+                entry, tp1, tp2, sl,
+                round(rr_ratio, 2),
+            ))
+            rowid = c.lastrowid
+            conn.commit()
+            log.info(f"💾 إشارة محفوظة (PENDING): {direction} {symbol} @ {entry} | id={rowid}")
+            return rowid or 0
+        finally:
+            conn.close()
+
+
+def update_signal_review(signal_id: int, approved: int, confidence: float, review_warning: str | None):
+    """يحدّث صف إشارة بالحقل الخاص بمراجعة Gemini."""
+    with _db_lock:
+        conn = sqlite3.connect(DB_FILE, timeout=10.0)
+        try:
+            conn.execute(
+                "UPDATE signals SET approved = ?, confidence = ?, review_warning = ? WHERE id = ?",
+                (int(bool(approved)), float(confidence) if confidence is not None else None, review_warning, signal_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def get_recent_pending_signals(limit: int = 10) -> list:
+    return db_fetchall(
+        "SELECT id, symbol, direction, entry, tp1, tp2, sl FROM signals WHERE status='PENDING' ORDER BY id DESC LIMIT ?",
+        (limit,)
+    )
+
+
+# ╔══════════════════════════════════════════╗
+# ║  إحصاءات ووظائف مساعدة                   ║
+# ╚══════════════════════════════════════════╝
+
 def get_win_rate() -> dict:
-    """
-    إحصائيات الصفقات الفعلية المغلقة فقط.
-    لا تشمل PENDING أو OPEN.
-    """
     row = db_fetchone("""
         SELECT
             COUNT(*),
@@ -208,9 +274,9 @@ def get_win_rate() -> dict:
         "avg_rr":       avg_rr,
     }
 
+# بقية الدوال كما في السطر الأصلي (get_recent_trades، get_open_signals_count، get_pending_signals، save_analysis، get_active_alerts، trigger_alert)
 
 def get_recent_trades(limit: int = 5) -> list:
-    """يُعيد آخر N صفقة مغلقة."""
     return db_fetchall("""
         SELECT symbol, direction, entry,
                status, result_pips, result_profit,
@@ -230,7 +296,6 @@ def get_open_signals_count() -> int:
 
 
 def get_pending_signals(symbol: str, direction: str) -> list:
-    """إشارات PENDING لرمز واتجاه محددين."""
     return db_fetchall("""
         SELECT id, entry, tp1, tp2, sl
         FROM signals
@@ -239,12 +304,8 @@ def get_pending_signals(symbol: str, direction: str) -> list:
           AND status    = 'PENDING'
         ORDER BY timestamp DESC
         LIMIT 5
-    """, (symbol, direction))
+    "", (symbol, direction))
 
-
-# ╔══════════════════════════════════════════╗
-# ║  عمليات التحليلات                        ║
-# ╚══════════════════════════════════════════╝
 
 def save_analysis(
     content:      str,
@@ -263,10 +324,6 @@ def save_analysis(
         gold_price, silver_price,
     ))
 
-
-# ╔══════════════════════════════════════════╗
-# ║  عمليات التنبيهات                        ║
-# ╚══════════════════════════════════════════╝
 
 def get_active_alerts() -> list:
     return db_fetchall("""
